@@ -557,15 +557,8 @@ async function initializeDbSchema(db) {
 
     // 初始化云端测速数据
     const checkNodes = await db.prepare("SELECT value FROM probe_settings WHERE key = 'cached_nodes_data'").first();
-    if (!checkNodes) {
-        try {
-            const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
-            if (res.ok) {
-                const dataText = await res.text();
-                await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?)").bind(dataText).run();
-            }
-        } catch(e) {}
-    }
+        // no external fetch - avoid GFW 1101 on raw.githubusercontent.com
+
 
     const tpsQueries = [
         `CREATE TABLE IF NOT EXISTS third_party_subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, is_enable INTEGER DEFAULT 1, added_at INTEGER, last_fetched_at INTEGER)`,
@@ -578,7 +571,8 @@ async function ensureDbSchema(db) {
     if (!schemaReadyPromise) {
         schemaReadyPromise = initializeDbSchema(db).catch(error => {
             schemaReadyPromise = null;
-            throw error;
+            // Log but don't re-throw: D1 schema init failures should not break auth endpoints
+            console.error('[ensureDbSchema] init error (non-fatal):', error?.message || error);
         });
     }
     return schemaReadyPromise;
