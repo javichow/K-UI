@@ -729,7 +729,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
     // 🌟 GitHub 云端拉取三网节点库
     if (method === 'POST' && subPath === 'admin/pull_github') {
         try {
-            const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
+            // KUI-1101: external nodes.json fetch disabled (was an edge-1101 source); cached seed is used instead.
             if (res.ok) {
                 const dataText = await res.text();
                 await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(dataText).run();
