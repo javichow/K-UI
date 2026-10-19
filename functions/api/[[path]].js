@@ -1599,12 +1599,30 @@ rules:
 
     if (action === "realtime_auth" && method === "POST") {
         await ensureDbSchema(db);
-        const username = await verifyAuth(request.headers.get("Authorization"), request, db, env, context);
+        let username = null;
+        try {
+            username = await verifyAuth(request.headers.get("Authorization"), request, db, env, context);
+        } catch (authErr) {
+            const _m = String((authErr && authErr.message) || authErr || '');
+            return new Response(JSON.stringify({ error: "D1_UNAVAILABLE: " + _m, d1_unavailable: true }),
+                { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } });
+        }
         const isAdminUser = username === (env.ADMIN_USERNAME || "admin");
         return Response.json({ success: isAdminUser, admin: isAdminUser }, { status: isAdminUser ? 200 : 403, headers: { "Cache-Control": "no-store" } });
     }
 
-    const currentUser = await verifyAuth(request.headers.get("Authorization"), request, db, env, context);
+    // KUI-D1-DEGRADED: a D1 outage (daily row-read/write limit) must not be
+    // reported as 401 Unauthorized -- the panel logs the user out on any 401,
+    // which made a temporary D1 limit look like a broken login. Surface it as
+    // 503 so the session survives and the UI can show a clear error.
+    let currentUser = null;
+    try {
+        currentUser = await verifyAuth(authHeader, request, db, env, context);
+    } catch (authErr) {
+        const _m = String((authErr && authErr.message) || authErr || '');
+        return new Response(JSON.stringify({ error: "D1_UNAVAILABLE: " + _m, d1_unavailable: true }),
+            { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } });
+    }
     const isAdmin = currentUser === (env.ADMIN_USERNAME || "admin");
     if (!currentUser) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
