@@ -534,7 +534,7 @@ async function initializeDbSchema(db) {
     try { await db.prepare("SELECT socks5_enable FROM servers LIMIT 1").first(); } catch (e) { const s5Cols = ['socks5_enable INTEGER DEFAULT 0', 'socks5_addr TEXT DEFAULT ""', 'socks5_port INTEGER DEFAULT 0', 'socks5_user TEXT DEFAULT ""', 'socks5_pass TEXT DEFAULT ""']; for (let col of s5Cols) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${col}`).run(); } catch(err){} } }
     try { await db.prepare("SELECT socks5_mode FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN socks5_mode TEXT DEFAULT 'global'").run(); } catch(err){} try { await db.prepare("ALTER TABLE servers ADD COLUMN socks5_domains TEXT DEFAULT ''").run(); } catch(err){} }
     try { await db.prepare("SELECT agent_token FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN agent_token TEXT").run(); } catch(err){} }
-    const ensureWarpColumn = async (name, definition) => { try { await db.prepare(`SELECT ${name} FROM servers LIMIT 1`).first(); } catch (error) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${name} ${definition}`).run(); } catch (alterError) { if (!/duplicate column/i.test(String(alterError?.message || alterError))) throw alterError; } } };
+    const ensureWarpColumn = async (name, definition) => { try { await db.prepare(`SELECT ${name} FROM servers LIMIT 1`).first(); } catch (error) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${name} ${definition}`).run(); } catch (alterError) { if (!/duplicate column/i.test(String(alterError?.message || alterError))) { console.error('[ensureWarpColumn] alter failed:', alterError?.message || alterError); } } } };
     await ensureWarpColumn('warp_mode', "TEXT NOT NULL DEFAULT 'off'");
     await ensureWarpColumn('warp_applied_mode', "TEXT NOT NULL DEFAULT 'off'");
     await ensureWarpColumn('warp_revision', 'INTEGER NOT NULL DEFAULT 0');
@@ -570,9 +570,22 @@ async function initializeDbSchema(db) {
 
 async function ensureDbSchema(db) {
     if (!schemaReadyPromise) {
-        schemaReadyPromise = initializeDbSchema(db).catch(error => {
-            schemaReadyPromise = null;
-            // Log but don't re-throw: D1 schema init failures should not break auth endpoints
+        schemaReadyPromise = (async () => {
+            // KUI-D1-QUOTA: the full init is ~60 D1 statements (30 writes + ~25
+            // reads). Running it on every request burned the D1 free-tier daily
+            // row-read/write quota, which broke the panel entirely. Probe two
+            // core tables first (2 cheap reads) and skip the init when the
+            // schema is already in place.
+            try {
+                await db.prepare("SELECT username FROM auth_sessions LIMIT 1").first();
+                await db.prepare("SELECT username FROM nodes LIMIT 1").first();
+                return;
+            } catch (e) { /* schema missing -> full init below */ }
+            await initializeDbSchema(db);
+        })().catch(error => {
+            // NEVER reset schemaReadyPromise here. Clearing it made every
+            // subsequent request re-run the whole init, so one failure turned
+            // into an endless D1 quota burn (read+write limit exceeded).
             console.error('[ensureDbSchema] init error (non-fatal):', error?.message || error);
         });
     }
@@ -729,8 +742,10 @@ async function handleProbeAPI(request, env, context, pathArray) {
     // 🌟 GitHub 云端拉取三网节点库
     if (method === 'POST' && subPath === 'admin/pull_github') {
         try {
-            // KUI-1101: external nodes.json fetch disabled (was an edge-1101 source); cached seed is used instead.
-            if (res.ok) {
+            // KUI-1101: the external nodes.json fetch is disabled (it was the
+            // edge-1101 source). The cached seed in probe_settings is used instead.
+            return Response.json({ error: 'External fetch disabled; cached_nodes_data is used' }, { status: 400 });
+            if (false && res.ok) {
                 const dataText = await res.text();
                 await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(dataText).run();
                 return Response.json({ success: true });
