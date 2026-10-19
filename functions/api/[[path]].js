@@ -580,7 +580,17 @@ async function ensureDbSchema(db) {
                 await db.prepare("SELECT username FROM auth_sessions LIMIT 1").first();
                 await db.prepare("SELECT username FROM nodes LIMIT 1").first();
                 return;
-            } catch (e) { /* schema missing -> full init below */ }
+            } catch (e) {
+                const _m = String((e && e.message) || e || '');
+                if (/D1_ERROR|exceeded D1|free tier|quota|rate limit|too much contention/i.test(_m)) {
+                    // D1 is unavailable (daily row-read/write limit reached).
+                    // The schema is fine; running the full init would only burn
+                    // more quota, so skip it and let the request fail normally.
+                    console.error('[ensureDbSchema] D1 unavailable, skipping init:', _m);
+                    return;
+                }
+                /* schema missing -> full init below */
+            }
             await initializeDbSchema(db);
         })().catch(error => {
             // NEVER reset schemaReadyPromise here. Clearing it made every
@@ -632,6 +642,15 @@ async function verifyAuth(authHeader, request, db, env, context) {
         context?.waitUntil(db.prepare('DELETE FROM auth_replays WHERE expires_at < ?').bind(Date.now()).run().catch(() => {}));
         return username;
     } catch (error) {
+        // KUI-D1-DEGRADED: a D1 outage (quota / limit) must NOT be reported as
+        // "Unauthorized". The panel logs the user out on any 401, so a
+        // temporarily unreadable DB made the whole panel look like a broken
+        // login. Re-throw so the request ends as 500/503 and the session
+        // survives; a genuinely invalid token still returns null below.
+        const _m = String((error && error.message) || error || '');
+        if (/D1_ERROR|exceeded D1|free tier|quota|rate limit|too much contention/i.test(_m)) {
+            throw error;
+        }
         return null;
     }
 }
