@@ -599,8 +599,16 @@ async function verifyAuth(authHeader, request, db, env, context) {
             const token = authHeader.slice(7);
             if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
             const tokenHash = await sha256(token);
-            const session = await db.prepare('SELECT username FROM auth_sessions WHERE token_hash = ? AND expires_at > ?').bind(tokenHash, Date.now()).first();
-            return session?.username || null;
+            const session = await db.prepare('SELECT username, expires_at FROM auth_sessions WHERE token_hash = ?').bind(tokenHash).first();
+            // KUI-SESSION-EXPIRY: compare the expiry in JS, not in SQL. If the
+            // pre-existing auth_sessions column has TEXT affinity, SQLite's
+            // `expires_at > <integer>` is always false (INTEGER < TEXT), so the
+            // session row was written but never matched -> every login was
+            // immediately rejected with 401. Number() handles both storages.
+            if (!session) return null;
+            const _exp = Number(session.expires_at || 0);
+            if (_exp && _exp <= Date.now()) return null;
+            return session.username || null;
         }
         const adminUser = env.ADMIN_USERNAME || "admin";
         const adminPass = env.ADMIN_PASSWORD;
