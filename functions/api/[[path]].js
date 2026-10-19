@@ -1617,7 +1617,7 @@ rules:
     // 503 so the session survives and the UI can show a clear error.
     let currentUser = null;
     try {
-        currentUser = await verifyAuth(authHeader, request, db, env, context);
+        currentUser = await verifyAuth(request.headers.get("Authorization"), request, db, env, context);
     } catch (authErr) {
         const _m = String((authErr && authErr.message) || authErr || '');
         return new Response(JSON.stringify({ error: "D1_UNAVAILABLE: " + _m, d1_unavailable: true }),
