@@ -1,4 +1,4 @@
-// rebuild 2026-10-16 23:50:24 - force CF Pages D1 rebind
+// rebuild 2026-10-20 00:55:09 - force CF Pages D1 rebind (KUI-D1-REBIND)
 // ==========================================
 // KUI Serverless 聚合网关后端 - 精简核心版
 // (包含：自动建表升级 + 极速8合1协议生成 + 探针管理 + Clash订阅 + 动态云端测速/主题)
