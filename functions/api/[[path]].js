@@ -1584,17 +1584,32 @@ rules:
     }
 
     if (action === "login" && method === "POST") {
-        await ensureDbSchema(db);
-        if (!(await loginAllowed(db, request))) return Response.json({ error: "Too many attempts" }, { status: 429, headers: { 'Retry-After': '900' } });
-        let credentials;
-        try { credentials = await readJsonBody(request, 8 * 1024); } catch { credentials = {}; }
-        const username = String(credentials.username || '').trim(); const password = String(credentials.password || '');
-        let valid = false;
-        if (username === (env.ADMIN_USERNAME || 'admin')) valid = password.length > 0 && password === env.ADMIN_PASSWORD;
-        else { const user = await db.prepare('SELECT password FROM users WHERE username = ? AND enable = 1').bind(username).first(); valid = !!user && await passwordMatches(password, user.password); if (valid && /^[0-9a-f]{64}$/i.test(user.password || '')) await db.prepare('UPDATE users SET password = ? WHERE username = ?').bind(await passwordHash(password), username).run(); }
-        if (valid) { const token = await sessionToken(); await db.prepare('INSERT INTO auth_sessions (token_hash, username, expires_at) VALUES (?, ?, ?)').bind(await sha256(token), username, Date.now() + 12 * 60 * 60 * 1000).run(); context.waitUntil(db.prepare('DELETE FROM auth_sessions WHERE expires_at < ?').bind(Date.now()).run().catch(() => {})); await db.prepare('DELETE FROM login_throttles WHERE key = ?').bind(loginThrottleKey(request)).run(); return Response.json({ success: true, token, role: username === (env.ADMIN_USERNAME || "admin") ? 'admin' : 'user' }); }
-        await recordLoginFailure(db, request);
-        return Response.json({ error: "Unauthorized" }, { status: 401 });
+        // KUI-D1-DEGRADED: D1 free-tier daily read/write limits make the
+        // database temporarily unusable. Report it as 503 with the reset
+        // time instead of an unhandled exception (Cloudflare 1101), and
+        // never let it look like a wrong password (401).
+        try {
+
+            await ensureDbSchema(db);
+            if (!(await loginAllowed(db, request))) return Response.json({ error: "Too many attempts" }, { status: 429, headers: { 'Retry-After': '900' } });
+            let credentials;
+            try { credentials = await readJsonBody(request, 8 * 1024); } catch { credentials = {}; }
+            const username = String(credentials.username || '').trim(); const password = String(credentials.password || '');
+            let valid = false;
+            if (username === (env.ADMIN_USERNAME || 'admin')) valid = password.length > 0 && password === env.ADMIN_PASSWORD;
+            else { const user = await db.prepare('SELECT password FROM users WHERE username = ? AND enable = 1').bind(username).first(); valid = !!user && await passwordMatches(password, user.password); if (valid && /^[0-9a-f]{64}$/i.test(user.password || '')) await db.prepare('UPDATE users SET password = ? WHERE username = ?').bind(await passwordHash(password), username).run(); }
+            if (valid) { const token = await sessionToken(); await db.prepare('INSERT INTO auth_sessions (token_hash, username, expires_at) VALUES (?, ?, ?)').bind(await sha256(token), username, Date.now() + 12 * 60 * 60 * 1000).run(); context.waitUntil(db.prepare('DELETE FROM auth_sessions WHERE expires_at < ?').bind(Date.now()).run().catch(() => {})); await db.prepare('DELETE FROM login_throttles WHERE key = ?').bind(loginThrottleKey(request)).run(); return Response.json({ success: true, token, role: username === (env.ADMIN_USERNAME || "admin") ? 'admin' : 'user' }); }
+            await recordLoginFailure(db, request);
+            return Response.json({ error: "Unauthorized" }, { status: 401 });
+    
+        } catch (loginErr) {
+            const _m = String((loginErr && loginErr.message) || loginErr || '');
+            if (/D1_ERROR|exceeded D1|free tier|quota|rate limit|too much contention/i.test(_m)) {
+                return new Response(JSON.stringify({ error: "D1_UNAVAILABLE: " + _m, d1_unavailable: true, reset_at: "00:00 UTC" }),
+                    { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } });
+            }
+            throw loginErr;
+        }
     }
 
     if (action === "realtime_auth" && method === "POST") {
