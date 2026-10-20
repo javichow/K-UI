@@ -1443,10 +1443,15 @@ export async function onRequest(context) {
 
             // --- 第三方订阅节点整合进订阅 ---
             try {
-                const { results: thNodes } = await db.prepare("SELECT * FROM third_party_nodes WHERE enable = 1").all();
+                // KUI-TP-TAG: join the owning subscription so every third-party
+                // node is tagged with its source (e.g. "freesub | <node name>").
+                // Clients show the remark, so the user can tell at a glance which
+                // nodes came from the integrated free subscription.
+                const { results: thNodes } = await db.prepare("SELECT n.*, s.name AS sub_name FROM third_party_nodes n LEFT JOIN third_party_subscriptions s ON s.id = n.subscription_id WHERE n.enable = 1").all();
                 for (const node of thNodes) {
                     try {
-                    const remark = encodeURIComponent(node.name || `TP_${node.protocol}_${node.port}`);
+                    const _src = String(node.sub_name || "第三方").trim();
+                    const remark = encodeURIComponent(`${_src} | ${node.name || `TP_${node.protocol}_${node.port}`}`);
                     let link = "";
                     const thirdIp = formatIpForLink(node.address);
                     const thirdSni = node.sni || '';
