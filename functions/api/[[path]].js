@@ -1456,7 +1456,24 @@ export async function onRequest(context) {
                     const thirdIp = formatIpForLink(node.address);
                     const thirdSni = node.sni || '';
                     switch (node.protocol) {
-                        case "VMess": link = (node.extra && node.extra.startsWith('vmess://')) ? node.extra : ''; break;
+                        case "VMess": {
+                        // KUI-TP-TAG: vmess carries its display name inside the
+                        // base64 JSON ("ps"), so tag it there -- otherwise the
+                        // VMess nodes would be the only ones without a source tag.
+                        if (node.extra && node.extra.startsWith('vmess://')) {
+                            try {
+                                const _blob = node.extra.slice(8);
+                                const _pad = _blob + '='.repeat((4 - _blob.length % 4) % 4);
+                                const _j = JSON.parse(atob(_pad));
+                                if (_j && typeof _j === 'object') {
+                                    const _ps = String(_j.ps || '');
+                                    if (!_ps.startsWith(_src)) _j.ps = _ps ? (_src + ' | ' + _ps) : _src;
+                                    link = 'vmess://' + btoa(unescape(encodeURIComponent(JSON.stringify(_j))));
+                                } else { link = node.extra; }
+                            } catch (e) { link = node.extra; }
+                        }
+                        break;
+                    }
                         case "VLESS": {
                             if (node.flow && (node.public_key || node.flow.includes('rprx'))) {
                                 link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&flow=${node.flow}&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key||''}&sid=${node.short_id||''}&type=${node.network||'tcp'}${node.path ? '&path=' + encodeURIComponent(node.path) : ''}#${remark}`;
