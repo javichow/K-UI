@@ -192,6 +192,16 @@ async function fetchPublicSubscription(initialUrl) {
     throw new Error('订阅重定向过多');
 }
 
+// KUI-JSON-HELPER: the subscription handler calls json(...) but the helper
+// was never defined in this deployment, so an invalid subscription token
+// crashed the Worker (Cloudflare 1101) instead of returning 404.
+function json(data, status = 200, headers = {}) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers }
+    });
+}
+
 function formatIpForLink(ip) {
     if (!ip || typeof ip !== 'string') return ip;
     if (ip.startsWith('[') && ip.endsWith(']')) return ip;
