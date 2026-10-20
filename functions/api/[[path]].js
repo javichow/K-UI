@@ -1320,267 +1320,280 @@ export async function onRequest(context) {
 
     // 🌟 核心拦截并拆分普通订阅与 Clash 订阅生成
     if (action === "sub" && method === "GET") {
-        await ensureDbSchema(db);
-        const subscriptionProtection = await db.prepare("SELECT value FROM probe_settings WHERE key = 'subscription_protection'").first();
-        if (subscriptionProtection?.value === 'true') {
-            return protectedSubscriptionResponse(request);
-        }
-        const urlObj = new URL(request.url); 
-        const ip = urlObj.searchParams.get("ip"); 
-        const reqUser = urlObj.searchParams.get("user"); 
-        const token = urlObj.searchParams.get("token"); 
-        const format = urlObj.searchParams.get("format"); 
-        const adminUser = env.ADMIN_USERNAME || "admin";
-
-        let isValid = false;
-        if (reqUser === adminUser) { 
-            let adminSubToken = '';
-            try { const r = await db.prepare("SELECT val FROM sys_config WHERE key='admin_sub_token'").first(); if(r && r.val) adminSubToken = r.val; } catch(e){} 
-            isValid = !!adminSubToken && token === adminSubToken;
-        } 
-        else { 
-            const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ? AND enable = 1").bind(reqUser).first();
-            if (u) isValid = !!u.sub_token && token === u.sub_token;
-        }
-        
-        // Invalid tokens deliberately look like absent endpoints. Protected
-        // subscriptions return a harmless HTTP 200 profile before validation.
-        if (!isValid) return json({ error: "Not found" }, 404);
-        
-        const now = Date.now(); 
-        let query; 
-        let sqlParams = [now];
-        
-        if (reqUser === adminUser) { 
-            query = `SELECT * FROM nodes WHERE enable = 1 AND (traffic_limit = 0 OR traffic_used < traffic_limit) AND (expire_time = 0 OR expire_time > ?) AND (username = ? OR username = 'admin')`; 
-            sqlParams.push(adminUser); 
-            if (ip) { query += " AND vps_ip = ?"; sqlParams.push(ip); } 
-        } else { 
-            query = `SELECT n.* FROM nodes n JOIN users u ON n.username = u.username WHERE n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) AND (n.expire_time = 0 OR n.expire_time > ?) AND n.username = ? AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?)`; 
-            sqlParams.push(reqUser, now); 
-            if (ip) { query += " AND n.vps_ip = ?"; sqlParams.push(ip); } 
-        }
-        
-        const { results } = await db.prepare(query).bind(...sqlParams).all(); 
-        
-        let subLinks = [];
-        let clashProxies = [];
-        let proxyNames = [];
-
-        for (let node of results) {
-            const vpsInfo = await db.prepare("SELECT name FROM servers WHERE ip = ?").bind(node.vps_ip).first(); 
-            const rawRemark = `${vpsInfo ? vpsInfo.name : 'KUI'} | ${node.protocol}_${node.port}`; 
-            const remark = encodeURIComponent(rawRemark); 
-            let link = "";
-            let cProxy = "";
-            const nodeIp = formatIpForLink(node.vps_ip);
-            const nodeSni = node.sni || '';
-
-            // --- 传统 Base64 URL 生成 ---
-            switch (node.protocol) {
-                case "VLESS": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=none&type=tcp#${remark}`; break;
-                case "XTLS-Reality": case "Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=tcp&headerType=none#${remark}`; break;
-                case "Hysteria2": link = `hysteria2://${encodeURIComponent(node.uuid || node.private_key)}@${nodeIp}:${node.port}/?insecure=1&sni=${encodeURIComponent(nodeSni)}&alpn=h3#${remark}`; break;
-                case "TUIC": link = `tuic://${node.uuid}:${node.private_key}@${nodeIp}:${node.port}?sni=${nodeSni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}`; break;
-                case "Trojan": link = `trojan://${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}&allowInsecure=1&type=tcp#${remark}`; break;
-                case "H2-Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=http&host=${encodeURIComponent(nodeSni)}#${remark}`; break;
-                case "gRPC-Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=grpc&serviceName=grpc#${remark}`; break;
-                case "AnyTLS": link = `anytls://${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}&insecure=1#${remark}`; break;
-                case "Naive": link = `naive+https://${node.uuid}:${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}#${remark}`; break;
-                case "Socks5": link = `socks5://${btoa(`${node.uuid}:${node.private_key}`)}@${nodeIp}:${node.port}#${remark}`; break;
-                case "VLESS-Argo": if (!(node.sni || '').includes('等待')) link = `vless://${node.uuid}@${node.sni}:443?encryption=none&security=tls&type=ws&host=${node.sni}&path=%2F&alpn=http%2F1.1#${remark}-Argo`; break;
-            }
-            if (link) subLinks.push(link);
-
-            // --- 动态拼装 Clash YAML 代理字典 (支持 Clash Meta / Mihomo) ---
-            if (format === 'clash') {
-                if (node.protocol.includes("VLESS") || node.protocol.includes("Reality")) {
-                    const serverIpOrSni = (node.protocol === 'VLESS-Argo' && !(node.sni || '').includes('等待')) ? node.sni : nodeIp;
-                    const serverPort = node.protocol === 'VLESS-Argo' ? 443 : node.port;
-                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: vless\n    server: ${yamlString(serverIpOrSni)}\n    port: ${serverPort}\n    uuid: ${yamlString(node.uuid)}\n    udp: true`;
-                    
-                    if (node.protocol === "XTLS-Reality" || node.protocol === "Reality") {
-                        cProxy += `\n    tls: true\n    flow: xtls-rprx-vision\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
-                     } else if (node.protocol === "gRPC-Reality") {
-                         cProxy += `\n    tls: true\n    alpn:\n      - h2\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    network: grpc\n    grpc-opts:\n      grpc-service-name: grpc\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
-                     } else if (node.protocol === "H2-Reality") {
-                         cProxy += `\n    tls: true\n    alpn:\n      - h2\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key || '')}\n      short-id: ${yamlString(node.short_id || "")}\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(nodeSni || nodeIp)}\n      path: "/"`;
-                    } else if (node.protocol === 'VLESS-Argo' && !(node.sni || '').includes('等待')) {
-                        cProxy += `\n    tls: true\n    servername: ${yamlString(nodeSni)}\n    network: ws\n    ws-opts:\n      path: "/"\n      headers:\n        Host: ${yamlString(nodeSni)}`;
-                    }
-                } else if (node.protocol === "Trojan") {
-                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: trojan\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.private_key)}\n    udp: true\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
-                } else if (node.protocol === "AnyTLS") {
-                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: anytls\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.private_key)}\n    client-fingerprint: chrome\n    udp: true\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
-                } else if (node.protocol === "Hysteria2") {
-                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: hysteria2\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.uuid || node.private_key)}\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
-                } else if (node.protocol === "TUIC") {
-                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: tuic\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    password: ${yamlString(node.private_key)}\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
-                }
-                
-                if (cProxy) {
-                    clashProxies.push(cProxy);
-                    proxyNames.push(yamlString(rawRemark));
-                }
-            }
-        }
-
-        // --- 第三方订阅节点整合进订阅 ---
+        // KUI-SUB-ERR: the subscription builder used to run OUTSIDE the
+        // top-level try/catch, so any error surfaced as a raw Cloudflare
+        // 1101 page with no clue what failed. Catch it here and return a
+        // readable JSON error instead (behaviour otherwise unchanged).
         try {
-            const { results: thNodes } = await db.prepare("SELECT * FROM third_party_nodes WHERE enable = 1").all();
-            for (const node of thNodes) {
-                try {
-                const remark = encodeURIComponent(node.name || `TP_${node.protocol}_${node.port}`);
+
+            await ensureDbSchema(db);
+            const subscriptionProtection = await db.prepare("SELECT value FROM probe_settings WHERE key = 'subscription_protection'").first();
+            if (subscriptionProtection?.value === 'true') {
+                return protectedSubscriptionResponse(request);
+            }
+            const urlObj = new URL(request.url); 
+            const ip = urlObj.searchParams.get("ip"); 
+            const reqUser = urlObj.searchParams.get("user"); 
+            const token = urlObj.searchParams.get("token"); 
+            const format = urlObj.searchParams.get("format"); 
+            const adminUser = env.ADMIN_USERNAME || "admin";
+
+            let isValid = false;
+            if (reqUser === adminUser) { 
+                let adminSubToken = '';
+                try { const r = await db.prepare("SELECT val FROM sys_config WHERE key='admin_sub_token'").first(); if(r && r.val) adminSubToken = r.val; } catch(e){} 
+                isValid = !!adminSubToken && token === adminSubToken;
+            } 
+            else { 
+                const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ? AND enable = 1").bind(reqUser).first();
+                if (u) isValid = !!u.sub_token && token === u.sub_token;
+            }
+        
+            // Invalid tokens deliberately look like absent endpoints. Protected
+            // subscriptions return a harmless HTTP 200 profile before validation.
+            if (!isValid) return json({ error: "Not found" }, 404);
+        
+            const now = Date.now(); 
+            let query; 
+            let sqlParams = [now];
+        
+            if (reqUser === adminUser) { 
+                query = `SELECT * FROM nodes WHERE enable = 1 AND (traffic_limit = 0 OR traffic_used < traffic_limit) AND (expire_time = 0 OR expire_time > ?) AND (username = ? OR username = 'admin')`; 
+                sqlParams.push(adminUser); 
+                if (ip) { query += " AND vps_ip = ?"; sqlParams.push(ip); } 
+            } else { 
+                query = `SELECT n.* FROM nodes n JOIN users u ON n.username = u.username WHERE n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) AND (n.expire_time = 0 OR n.expire_time > ?) AND n.username = ? AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?)`; 
+                sqlParams.push(reqUser, now); 
+                if (ip) { query += " AND n.vps_ip = ?"; sqlParams.push(ip); } 
+            }
+        
+            const { results } = await db.prepare(query).bind(...sqlParams).all(); 
+        
+            let subLinks = [];
+            let clashProxies = [];
+            let proxyNames = [];
+
+            for (let node of results) {
+                const vpsInfo = await db.prepare("SELECT name FROM servers WHERE ip = ?").bind(node.vps_ip).first(); 
+                const rawRemark = `${vpsInfo ? vpsInfo.name : 'KUI'} | ${node.protocol}_${node.port}`; 
+                const remark = encodeURIComponent(rawRemark); 
                 let link = "";
-                const thirdIp = formatIpForLink(node.address);
-                const thirdSni = node.sni || '';
+                let cProxy = "";
+                const nodeIp = formatIpForLink(node.vps_ip);
+                const nodeSni = node.sni || '';
+
+                // --- 传统 Base64 URL 生成 ---
                 switch (node.protocol) {
-                    case "VMess": link = (node.extra && node.extra.startsWith('vmess://')) ? node.extra : ''; break;
-                    case "VLESS": {
-                        if (node.flow && (node.public_key || node.flow.includes('rprx'))) {
-                            link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&flow=${node.flow}&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key||''}&sid=${node.short_id||''}&type=${node.network||'tcp'}${node.path ? '&path=' + encodeURIComponent(node.path) : ''}#${remark}`;
-                        } else {
-                            link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&security=none&type=${node.network||'tcp'}${node.path ? '&path=' + encodeURIComponent(node.path) : ''}${node.host ? '&host=' + encodeURIComponent(node.host) : ''}#${remark}`;
-                        }
-                        break;
-                    }
-                    case "XTLS-Reality": case "Reality": link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&flow=${node.flow||'xtls-rprx-vision'}&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id||""}&type=${node.network||'tcp'}${node.path?'&path='+encodeURIComponent(node.path):''}${node.host?'&host='+encodeURIComponent(node.host):''}#${remark}`; break;
-                    case "Hysteria2": link = `hysteria2://${encodeURIComponent(node.uuid || node.password)}@${thirdIp}:${node.port}/?insecure=1&sni=${encodeURIComponent(thirdSni)}&alpn=h3#${remark}`; break;
-                    case "TUIC": link = `tuic://${node.uuid}:${node.password}@${thirdIp}:${node.port}?sni=${thirdSni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}`; break;
-                    case "Trojan": link = `trojan://${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}&allowInsecure=1&type=tcp#${remark}`; break;
-                    case "H2-Reality": link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=http#${remark}`; break;
-                    case "gRPC-Reality": link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=grpc&serviceName=grpc#${remark}`; break;
-                    case "AnyTLS": link = `anytls://${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}&insecure=1#${remark}`; break;
-                    case "Naive": link = `naive+https://${node.uuid}:${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}#${remark}`; break;
-                    case "Socks5": link = `socks5://${btoa(unescape(encodeURIComponent(`${node.uuid}:${node.password}`)))}@${thirdIp}:${node.port}#${remark}`; break;
-                    case "SS": {
-                        const method = node.uuid || (() => { try { return JSON.parse(node.extra || '{}').method; } catch(e) { return ''; } })();
-                        link = `ss://${btoa(unescape(encodeURIComponent(`${method}:${node.password}`)))}@${thirdIp}:${node.port}#${remark}`;
-                        break;
-                    }
-                    case "SSR": link = `ssr://${btoa(unescape(encodeURIComponent(`${thirdIp}:${node.port}:origin:${node.uuid}:plain:${btoa(node.password || '')}/?remarks=${btoa(unescape(encodeURIComponent(node.name || 'SSR')))}`)))}`; break;
+                    case "VLESS": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=none&type=tcp#${remark}`; break;
+                    case "XTLS-Reality": case "Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=tcp&headerType=none#${remark}`; break;
+                    case "Hysteria2": link = `hysteria2://${encodeURIComponent(node.uuid || node.private_key)}@${nodeIp}:${node.port}/?insecure=1&sni=${encodeURIComponent(nodeSni)}&alpn=h3#${remark}`; break;
+                    case "TUIC": link = `tuic://${node.uuid}:${node.private_key}@${nodeIp}:${node.port}?sni=${nodeSni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}`; break;
+                    case "Trojan": link = `trojan://${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}&allowInsecure=1&type=tcp#${remark}`; break;
+                    case "H2-Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=http&host=${encodeURIComponent(nodeSni)}#${remark}`; break;
+                    case "gRPC-Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=grpc&serviceName=grpc#${remark}`; break;
+                    case "AnyTLS": link = `anytls://${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}&insecure=1#${remark}`; break;
+                    case "Naive": link = `naive+https://${node.uuid}:${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}#${remark}`; break;
+                    case "Socks5": link = `socks5://${btoa(`${node.uuid}:${node.private_key}`)}@${nodeIp}:${node.port}#${remark}`; break;
+                    case "VLESS-Argo": if (!(node.sni || '').includes('等待')) link = `vless://${node.uuid}@${node.sni}:443?encryption=none&security=tls&type=ws&host=${node.sni}&path=%2F&alpn=http%2F1.1#${remark}-Argo`; break;
                 }
                 if (link) subLinks.push(link);
 
+                // --- 动态拼装 Clash YAML 代理字典 (支持 Clash Meta / Mihomo) ---
                 if (format === 'clash') {
-                    let cProxy = "";
-                    if (node.protocol === "VMess") {
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: vmess\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    alterId: 0\n    cipher: auto\n    udp: true${node.network && node.network !== 'tcp' ? `\n    network: ${yamlString(node.network)}${node.host ? `\n    ws-headers:\n      Host: ${yamlString(node.host)}` : ''}${node.path ? `\n    ws-path: ${yamlString(node.path)}` : ''}` : ''}`;
-                    } else if (node.protocol.includes("VLESS") || node.protocol.includes("Reality")) {
-                        const isReality = (node.flow && node.flow.includes('rprx')) || ["XTLS-Reality", "Reality", "H2-Reality", "gRPC-Reality"].includes(node.protocol);
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: vless\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    udp: true`;
-                        if (isReality) {
-                             cProxy += `\n    tls: true${['http', 'grpc'].includes((node.network || '').toLowerCase()) || ['H2-Reality', 'gRPC-Reality'].includes(node.protocol) ? '\n    alpn:\n      - h2' : ''}\n    servername: ${yamlString(thirdSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key || '')}\n      short-id: ${yamlString(node.short_id || "")}`;
-                            if (((node.protocol === "Reality" || node.protocol === "XTLS-Reality") && node.flow && node.flow.includes('rprx')) || node.protocol === "VLESS") {
-                                cProxy += `\n    flow: ${node.flow || 'xtls-rprx-vision'}`;
-                            }
-                            const net = node.network || 'tcp';
-                            if (net === 'grpc') {
-                                cProxy += `\n    network: grpc\n    grpc-opts:\n      grpc-service-name: ${node.extra?.serviceName || 'grpc'}`;
-                            } else if (net === 'http') {
-                                const path = node.path || '/';
-                                const hostHeader = node.host || thirdSni || thirdIp;
-                                cProxy += `\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(hostHeader)}\n      path: ${yamlString(path)}`;
-                            } else if (net === 'ws') {
-                                const path = node.path || '/';
-                                const hostHeader = node.host || thirdSni || thirdIp;
-                                cProxy += `\n    network: ws\n    ws-opts:\n      path: ${yamlString(path)}\n      headers:\n        Host: ${yamlString(hostHeader)}`;
-                            }
-                        } else if (node.protocol === "gRPC-Reality") {
-                            cProxy += `\n    tls: true\n    servername: ${yamlString(thirdSni)}\n    client-fingerprint: chrome\n    network: grpc\n    grpc-opts:\n      grpc-service-name: grpc\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
+                    if (node.protocol.includes("VLESS") || node.protocol.includes("Reality")) {
+                        const serverIpOrSni = (node.protocol === 'VLESS-Argo' && !(node.sni || '').includes('等待')) ? node.sni : nodeIp;
+                        const serverPort = node.protocol === 'VLESS-Argo' ? 443 : node.port;
+                        cProxy = `  - name: ${yamlString(rawRemark)}\n    type: vless\n    server: ${yamlString(serverIpOrSni)}\n    port: ${serverPort}\n    uuid: ${yamlString(node.uuid)}\n    udp: true`;
+                    
+                        if (node.protocol === "XTLS-Reality" || node.protocol === "Reality") {
+                            cProxy += `\n    tls: true\n    flow: xtls-rprx-vision\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
+                         } else if (node.protocol === "gRPC-Reality") {
+                             cProxy += `\n    tls: true\n    alpn:\n      - h2\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    network: grpc\n    grpc-opts:\n      grpc-service-name: grpc\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
                          } else if (node.protocol === "H2-Reality") {
-                             cProxy += `\n    tls: true\n    servername: ${yamlString(thirdSni)}\n    client-fingerprint: chrome\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(thirdSni || thirdIp)}\n      path: "/"`;
+                             cProxy += `\n    tls: true\n    alpn:\n      - h2\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key || '')}\n      short-id: ${yamlString(node.short_id || "")}\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(nodeSni || nodeIp)}\n      path: "/"`;
+                        } else if (node.protocol === 'VLESS-Argo' && !(node.sni || '').includes('等待')) {
+                            cProxy += `\n    tls: true\n    servername: ${yamlString(nodeSni)}\n    network: ws\n    ws-opts:\n      path: "/"\n      headers:\n        Host: ${yamlString(nodeSni)}`;
                         }
                     } else if (node.protocol === "Trojan") {
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: trojan\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.password)}\n    udp: true\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        cProxy = `  - name: ${yamlString(rawRemark)}\n    type: trojan\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.private_key)}\n    udp: true\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                     } else if (node.protocol === "AnyTLS") {
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: anytls\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.password)}\n    client-fingerprint: chrome\n    udp: true\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        cProxy = `  - name: ${yamlString(rawRemark)}\n    type: anytls\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.private_key)}\n    client-fingerprint: chrome\n    udp: true\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                     } else if (node.protocol === "Hysteria2") {
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: hysteria2\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.uuid || node.password)}\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        cProxy = `  - name: ${yamlString(rawRemark)}\n    type: hysteria2\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.uuid || node.private_key)}\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                     } else if (node.protocol === "TUIC") {
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: tuic\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    password: ${yamlString(node.password)}\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
-                    } else if (node.protocol === "SS") {
-                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: ss\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    cipher: ${yamlString(node.uuid)}\n    password: ${yamlString(node.password)}`;
+                        cProxy = `  - name: ${yamlString(rawRemark)}\n    type: tuic\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    password: ${yamlString(node.private_key)}\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                     }
+                
                     if (cProxy) {
                         clashProxies.push(cProxy);
-                        proxyNames.push(yamlString(node.name || 'TP'));
+                        proxyNames.push(yamlString(rawRemark));
                     }
                 }
-                } catch(e) {}
             }
-        } catch (e) {}
 
-        // Residential SOCKS5 endpoints are runtime proxy records rather than
-        // regular protocol nodes, so append them explicitly for the admin.
-        // They include shared proxy credentials and must never be exposed to
-        // ordinary user subscriptions.
-        if (reqUser === adminUser && env.PROXY_USER && env.PROXY_PASS) {
+            // --- 第三方订阅节点整合进订阅 ---
             try {
-                const cutoff = Date.now() - 1800000;
-                const { results: proxyServers } = await db.prepare('SELECT ip, details FROM proxy_ctrl_servers WHERE last_seen >= ?').bind(cutoff).all();
-                for (const server of proxyServers || []) {
-                    if (ip && server.ip !== ip) continue;
-                    let details = [];
-                    try { details = JSON.parse(server.details || '[]'); } catch {}
-                    const active = details.find(detail => detail?.active && Number.isInteger(Number(detail.port)) && Number(detail.port) >= 1 && Number(detail.port) <= 65535);
-                    if (!active) continue;
-                    const port = Number(active.port);
-                    const serverIp = formatIpForLink(server.ip);
-                    const name = `住宅 SOCKS5 | ${active.country || 'AUTO'} | ${server.ip}:${port}`;
-                    const encodedCredentials = btoa(unescape(encodeURIComponent(`${env.PROXY_USER}:${env.PROXY_PASS}`)));
-                    subLinks.push(`socks5://${encodedCredentials}@${serverIp}:${port}#${encodeURIComponent(name)}`);
-                    if (format === 'clash') {
-                        clashProxies.push(`  - name: ${yamlString(name)}\n    type: socks5\n    server: ${yamlString(serverIp)}\n    port: ${port}\n    username: ${yamlString(env.PROXY_USER)}\n    password: ${yamlString(env.PROXY_PASS)}\n    udp: true`);
-                        proxyNames.push(yamlString(name));
+                const { results: thNodes } = await db.prepare("SELECT * FROM third_party_nodes WHERE enable = 1").all();
+                for (const node of thNodes) {
+                    try {
+                    const remark = encodeURIComponent(node.name || `TP_${node.protocol}_${node.port}`);
+                    let link = "";
+                    const thirdIp = formatIpForLink(node.address);
+                    const thirdSni = node.sni || '';
+                    switch (node.protocol) {
+                        case "VMess": link = (node.extra && node.extra.startsWith('vmess://')) ? node.extra : ''; break;
+                        case "VLESS": {
+                            if (node.flow && (node.public_key || node.flow.includes('rprx'))) {
+                                link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&flow=${node.flow}&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key||''}&sid=${node.short_id||''}&type=${node.network||'tcp'}${node.path ? '&path=' + encodeURIComponent(node.path) : ''}#${remark}`;
+                            } else {
+                                link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&security=none&type=${node.network||'tcp'}${node.path ? '&path=' + encodeURIComponent(node.path) : ''}${node.host ? '&host=' + encodeURIComponent(node.host) : ''}#${remark}`;
+                            }
+                            break;
+                        }
+                        case "XTLS-Reality": case "Reality": link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&flow=${node.flow||'xtls-rprx-vision'}&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id||""}&type=${node.network||'tcp'}${node.path?'&path='+encodeURIComponent(node.path):''}${node.host?'&host='+encodeURIComponent(node.host):''}#${remark}`; break;
+                        case "Hysteria2": link = `hysteria2://${encodeURIComponent(node.uuid || node.password)}@${thirdIp}:${node.port}/?insecure=1&sni=${encodeURIComponent(thirdSni)}&alpn=h3#${remark}`; break;
+                        case "TUIC": link = `tuic://${node.uuid}:${node.password}@${thirdIp}:${node.port}?sni=${thirdSni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}`; break;
+                        case "Trojan": link = `trojan://${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}&allowInsecure=1&type=tcp#${remark}`; break;
+                        case "H2-Reality": link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=http#${remark}`; break;
+                        case "gRPC-Reality": link = `vless://${node.uuid}@${thirdIp}:${node.port}?encryption=none&security=reality&sni=${thirdSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=grpc&serviceName=grpc#${remark}`; break;
+                        case "AnyTLS": link = `anytls://${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}&insecure=1#${remark}`; break;
+                        case "Naive": link = `naive+https://${node.uuid}:${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}#${remark}`; break;
+                        case "Socks5": link = `socks5://${btoa(unescape(encodeURIComponent(`${node.uuid}:${node.password}`)))}@${thirdIp}:${node.port}#${remark}`; break;
+                        case "SS": {
+                            const method = node.uuid || (() => { try { return JSON.parse(node.extra || '{}').method; } catch(e) { return ''; } })();
+                            link = `ss://${btoa(unescape(encodeURIComponent(`${method}:${node.password}`)))}@${thirdIp}:${node.port}#${remark}`;
+                            break;
+                        }
+                        case "SSR": link = `ssr://${btoa(unescape(encodeURIComponent(`${thirdIp}:${node.port}:origin:${node.uuid}:plain:${btoa(node.password || '')}/?remarks=${btoa(unescape(encodeURIComponent(node.name || 'SSR')))}`)))}`; break;
                     }
+                    if (link) subLinks.push(link);
+
+                    if (format === 'clash') {
+                        let cProxy = "";
+                        if (node.protocol === "VMess") {
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: vmess\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    alterId: 0\n    cipher: auto\n    udp: true${node.network && node.network !== 'tcp' ? `\n    network: ${yamlString(node.network)}${node.host ? `\n    ws-headers:\n      Host: ${yamlString(node.host)}` : ''}${node.path ? `\n    ws-path: ${yamlString(node.path)}` : ''}` : ''}`;
+                        } else if (node.protocol.includes("VLESS") || node.protocol.includes("Reality")) {
+                            const isReality = (node.flow && node.flow.includes('rprx')) || ["XTLS-Reality", "Reality", "H2-Reality", "gRPC-Reality"].includes(node.protocol);
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: vless\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    udp: true`;
+                            if (isReality) {
+                                 cProxy += `\n    tls: true${['http', 'grpc'].includes((node.network || '').toLowerCase()) || ['H2-Reality', 'gRPC-Reality'].includes(node.protocol) ? '\n    alpn:\n      - h2' : ''}\n    servername: ${yamlString(thirdSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key || '')}\n      short-id: ${yamlString(node.short_id || "")}`;
+                                if (((node.protocol === "Reality" || node.protocol === "XTLS-Reality") && node.flow && node.flow.includes('rprx')) || node.protocol === "VLESS") {
+                                    cProxy += `\n    flow: ${node.flow || 'xtls-rprx-vision'}`;
+                                }
+                                const net = node.network || 'tcp';
+                                if (net === 'grpc') {
+                                    cProxy += `\n    network: grpc\n    grpc-opts:\n      grpc-service-name: ${node.extra?.serviceName || 'grpc'}`;
+                                } else if (net === 'http') {
+                                    const path = node.path || '/';
+                                    const hostHeader = node.host || thirdSni || thirdIp;
+                                    cProxy += `\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(hostHeader)}\n      path: ${yamlString(path)}`;
+                                } else if (net === 'ws') {
+                                    const path = node.path || '/';
+                                    const hostHeader = node.host || thirdSni || thirdIp;
+                                    cProxy += `\n    network: ws\n    ws-opts:\n      path: ${yamlString(path)}\n      headers:\n        Host: ${yamlString(hostHeader)}`;
+                                }
+                            } else if (node.protocol === "gRPC-Reality") {
+                                cProxy += `\n    tls: true\n    servername: ${yamlString(thirdSni)}\n    client-fingerprint: chrome\n    network: grpc\n    grpc-opts:\n      grpc-service-name: grpc\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
+                             } else if (node.protocol === "H2-Reality") {
+                                 cProxy += `\n    tls: true\n    servername: ${yamlString(thirdSni)}\n    client-fingerprint: chrome\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(thirdSni || thirdIp)}\n      path: "/"`;
+                            }
+                        } else if (node.protocol === "Trojan") {
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: trojan\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.password)}\n    udp: true\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        } else if (node.protocol === "AnyTLS") {
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: anytls\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.password)}\n    client-fingerprint: chrome\n    udp: true\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        } else if (node.protocol === "Hysteria2") {
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: hysteria2\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.uuid || node.password)}\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        } else if (node.protocol === "TUIC") {
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: tuic\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    password: ${yamlString(node.password)}\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                        } else if (node.protocol === "SS") {
+                            cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: ss\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    cipher: ${yamlString(node.uuid)}\n    password: ${yamlString(node.password)}`;
+                        }
+                        if (cProxy) {
+                            clashProxies.push(cProxy);
+                            proxyNames.push(yamlString(node.name || 'TP'));
+                        }
+                    }
+                    } catch(e) {}
                 }
-            } catch (error) {
-                console.error('Failed to append residential SOCKS5 subscriptions:', error);
+            } catch (e) {}
+
+            // Residential SOCKS5 endpoints are runtime proxy records rather than
+            // regular protocol nodes, so append them explicitly for the admin.
+            // They include shared proxy credentials and must never be exposed to
+            // ordinary user subscriptions.
+            if (reqUser === adminUser && env.PROXY_USER && env.PROXY_PASS) {
+                try {
+                    const cutoff = Date.now() - 1800000;
+                    const { results: proxyServers } = await db.prepare('SELECT ip, details FROM proxy_ctrl_servers WHERE last_seen >= ?').bind(cutoff).all();
+                    for (const server of proxyServers || []) {
+                        if (ip && server.ip !== ip) continue;
+                        let details = [];
+                        try { details = JSON.parse(server.details || '[]'); } catch {}
+                        const active = details.find(detail => detail?.active && Number.isInteger(Number(detail.port)) && Number(detail.port) >= 1 && Number(detail.port) <= 65535);
+                        if (!active) continue;
+                        const port = Number(active.port);
+                        const serverIp = formatIpForLink(server.ip);
+                        const name = `住宅 SOCKS5 | ${active.country || 'AUTO'} | ${server.ip}:${port}`;
+                        const encodedCredentials = btoa(unescape(encodeURIComponent(`${env.PROXY_USER}:${env.PROXY_PASS}`)));
+                        subLinks.push(`socks5://${encodedCredentials}@${serverIp}:${port}#${encodeURIComponent(name)}`);
+                        if (format === 'clash') {
+                            clashProxies.push(`  - name: ${yamlString(name)}\n    type: socks5\n    server: ${yamlString(serverIp)}\n    port: ${port}\n    username: ${yamlString(env.PROXY_USER)}\n    password: ${yamlString(env.PROXY_PASS)}\n    udp: true`);
+                            proxyNames.push(yamlString(name));
+                        }
+                    }
+                } catch (error) {
+                    console.error('Failed to append residential SOCKS5 subscriptions:', error);
+                }
             }
-        }
 
-        // --- 若为 Clash 格式，渲染 YAML 返回 ---
-        if (format === 'clash') {
-            const proxyGroupList = proxyNames.length > 0 ? proxyNames.map(n => `      - ${n}`).join('\n') : '      - DIRECT';
-            const hasIPv6 = results.some(n => /:/.test(n.vps_ip)) || clashProxies.some(p => /server:\s*["']?\[/.test(p));
-            const clashYaml = `port: 7890
-socks-port: 7891
-allow-lan: true
-mode: rule
-log-level: info
-ipv6: ${hasIPv6 ? 'true' : 'false'}
-external-controller: 127.0.0.1:9090
+            // --- 若为 Clash 格式，渲染 YAML 返回 ---
+            if (format === 'clash') {
+                const proxyGroupList = proxyNames.length > 0 ? proxyNames.map(n => `      - ${n}`).join('\n') : '      - DIRECT';
+                const hasIPv6 = results.some(n => /:/.test(n.vps_ip)) || clashProxies.some(p => /server:\s*["']?\[/.test(p));
+                const clashYaml = `port: 7890
+    socks-port: 7891
+    allow-lan: true
+    mode: rule
+    log-level: info
+    ipv6: ${hasIPv6 ? 'true' : 'false'}
+    external-controller: 127.0.0.1:9090
 
-proxies:
-${clashProxies.join('\n')}
-
-proxy-groups:
-  - name: "PROXY"
-    type: select
     proxies:
-      - "AUTO"
-${proxyGroupList}
-  - name: "AUTO"
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    proxies:
-${proxyGroupList}
+    ${clashProxies.join('\n')}
 
-rules:
-  - MATCH,PROXY
-`;
-            return new Response(clashYaml, { 
-                headers: { 
-                    "Content-Type": "text/yaml; charset=utf-8", 
-                    "Content-Disposition": "attachment; filename=kui-clash.yaml" 
-                }
-            });
+    proxy-groups:
+      - name: "PROXY"
+        type: select
+        proxies:
+          - "AUTO"
+    ${proxyGroupList}
+      - name: "AUTO"
+        type: url-test
+        url: http://www.gstatic.com/generate_204
+        interval: 300
+        proxies:
+    ${proxyGroupList}
+
+    rules:
+      - MATCH,PROXY
+    `;
+                return new Response(clashYaml, { 
+                    headers: { 
+                        "Content-Type": "text/yaml; charset=utf-8", 
+                        "Content-Disposition": "attachment; filename=kui-clash.yaml" 
+                    }
+                });
+            }
+
+            // --- 否则走默认的 Base64 普通订阅格式 ---
+            return new Response(btoa(unescape(encodeURIComponent(subLinks.join('\n')))), { headers: { "Content-Type": "text/plain; charset=utf-8" }});
+    
+        } catch (subErr) {
+            const _m = String((subErr && subErr.message) || subErr || '');
+            console.error('[api/sub] build failed:', _m, (subErr && subErr.stack) || '');
+            return new Response(JSON.stringify({ error: "SUB_ERR: " + _m, d1_unavailable: /D1_ERROR|exceeded D1|free tier|quota/i.test(_m) }),
+                { status: 500, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
-
-        // --- 否则走默认的 Base64 普通订阅格式 ---
-        return new Response(btoa(unescape(encodeURIComponent(subLinks.join('\n')))), { headers: { "Content-Type": "text/plain; charset=utf-8" }});
     }
 
     if (action === "login" && method === "POST") {
