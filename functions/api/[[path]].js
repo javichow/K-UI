@@ -514,6 +514,9 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, uuid TEXT NOT NULL, vps_ip TEXT NOT NULL, protocol TEXT NOT NULL, port INTEGER NOT NULL, sni TEXT, private_key TEXT, public_key TEXT, short_id TEXT, relay_type TEXT, target_ip TEXT, target_port INTEGER, target_id TEXT, enable INTEGER DEFAULT 1, traffic_used INTEGER DEFAULT 0, traffic_limit INTEGER DEFAULT 0, expire_time INTEGER DEFAULT 0, username TEXT DEFAULT 'admin', network TEXT DEFAULT 'tcp', FOREIGN KEY(vps_ip) REFERENCES servers(ip) ON DELETE CASCADE)`,
         `CREATE TABLE IF NOT EXISTS traffic_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, delta_bytes INTEGER DEFAULT 0, timestamp INTEGER NOT NULL, FOREIGN KEY(ip) REFERENCES servers(ip) ON DELETE CASCADE)`,
         `CREATE INDEX IF NOT EXISTS idx_traffic_ip_time ON traffic_stats(ip, timestamp)`,
+      // KUI-STATS-AGG: per-day totals, so the stats endpoint reads a handful of
+      // rows instead of scanning a week of raw traffic rows.
+      `CREATE TABLE IF NOT EXISTS traffic_daily (ip TEXT NOT NULL, day TEXT NOT NULL, total_bytes INTEGER DEFAULT 0, PRIMARY KEY (ip, day))`,
         `CREATE TABLE IF NOT EXISTS sys_config (key TEXT PRIMARY KEY, val TEXT, ts INTEGER)`,
         `CREATE TABLE IF NOT EXISTS proxy_ctrl_servers (ip TEXT PRIMARY KEY, details TEXT, last_seen INTEGER)`,
         `CREATE TABLE IF NOT EXISTS server_logs (ip TEXT PRIMARY KEY, logs TEXT, updated_at INTEGER)`,
@@ -1055,7 +1058,131 @@ async function checkOfflineServers(env) {
 // ==============================================
 // KUI 主体接口路由
 // ==============================================
+// KUI-D1-CACHE: the D1 free tier allows only ~5M row reads/day. The panel
+// polls these read endpoints every few seconds and every poll used to hit D1,
+// which is what exhausted the quota (the panel then showed D1_UNAVAILABLE).
+// Cache the response bodies in-isolate, keyed by endpoint + query +
+// Authorization, so no data can leak between users. The D1 read cost becomes
+// independent of the poll rate.
+const KUI_READ_CACHE = new Map();
+const KUI_READ_CACHE_TTL = 45000;   // ms
+const KUI_READ_CACHE_MAX = 400;
+const KUI_CACHEABLE = new Set(["data", "nodes", "users", "vps", "settings",
+                               "stats", "probe", "proxy", "thirdparty", "whoami", "sub"]);
+const KUI_D1_QUOTA = /D1_ERROR|exceeded D1|free tier|quota|too much contention/i;
+const KUI_COUNTERS = new Map();
+let KUI_COUNTER_FLUSH = 0;
+
+function kuiCacheKey(context) {
+  const url = new URL(context.request.url);
+  return (url.pathname + url.search + "|" +
+          (context.request.headers.get("Authorization") || "")).slice(0, 700);
+}
+
+// KUI-DIAG: per-endpoint request counters, flushed to the edge cache (no D1
+// writes) every 10 minutes so /api/diag can show where the requests come from.
+async function kuiFlushCounters(context) {
+  try {
+    if (!KUI_COUNTERS.size) return;
+    const bucket = Math.floor(Date.now() / 600000);
+    const payload = {};
+    for (const [k, v] of KUI_COUNTERS) payload[k] = v;
+    await caches.default.put(
+      new Request("https://kui-diag.internal/counters/" + bucket),
+      new Response(JSON.stringify(payload), { headers: { "Cache-Control": "max-age=3600" } }));
+    KUI_COUNTERS.clear();
+  } catch (e) { /* cache API unavailable - diagnostics only */ }
+}
+
 export async function onRequest(context) {
+  const { request } = context;
+  const method = request.method;
+  const action = (context.params && context.params.path && context.params.path[0]) || "";
+  KUI_COUNTERS.set(action, (KUI_COUNTERS.get(action) || 0) + 1);
+  if (Date.now() - KUI_COUNTER_FLUSH > 600000) {
+    KUI_COUNTER_FLUSH = Date.now();
+    try { context.waitUntil(kuiFlushCounters(context)); } catch (e) {}
+  }
+
+  // KUI-SUB-CACHE: the client re-fetches the subscription every few minutes.
+  // Serve it from the shared edge cache (the URL carries the user's token, so
+  // the cache key is user specific) instead of reading D1 on every poll.
+  if (action === "sub" && method === "GET") {
+    try {
+      const cacheKey = new Request(request.url, { method: "GET" });
+      const cached = await caches.default.match(cacheKey);
+      if (cached) {
+        const h = new Headers(cached.headers);
+        h.set("X-KUI-Cache", "HIT");
+        return new Response(cached.body, { status: cached.status, headers: h });
+      }
+      const resp = await handleRequest(context);
+      if (resp && resp.status === 200) {
+        try {
+          const body = await resp.clone().arrayBuffer();
+          const headers = new Headers(resp.headers);
+          headers.delete("cache-control");
+          headers.set("cache-control", "public, max-age=60");
+          context.waitUntil(caches.default.put(cacheKey, new Response(body, { status: 200, headers })).catch(() => {}));
+        } catch (e) {}
+      }
+      return resp;
+    } catch (err) {
+      const msg = (err && err.message) ? err.message : String(err);
+      if (KUI_D1_QUOTA.test(msg)) {
+        return new Response(JSON.stringify({ error: "D1_UNAVAILABLE: " + msg, d1_unavailable: true, reset_at: "00:00 UTC" }),
+          { status: 503, headers: { "Content-Type": "application/json", "Retry-After": "300" } });
+      }
+      console.error("[api/sub] unhandled error:", msg, (err && err.stack) || "");
+      return new Response(JSON.stringify({ error: "SERVER_ERR: " + msg }),
+        { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+  }
+
+  const cacheable = method === "GET" && KUI_CACHEABLE.has(action);
+  const key = cacheable ? kuiCacheKey(context) : null;
+  if (key) {
+    const hit = KUI_READ_CACHE.get(key);
+    if (hit && (Date.now() - hit.t) < KUI_READ_CACHE_TTL) {
+      const h = new Headers(hit.headers);
+      h.set("X-KUI-Cache", "HIT");
+      return new Response(hit.body, { status: hit.status, headers: h });
+    }
+  }
+
+  let resp;
+  try {
+    resp = await handleRequest(context);
+  } catch (err) {
+    // KUI-D1-DEGRADED: every endpoint now ends in a clean JSON error instead of
+    // an unhandled exception (which Cloudflare renders as an HTML page, so the
+    // panel showed "backend error: <!DOCTYPE html>...").
+    const msg = (err && err.message) ? err.message : String(err);
+    console.error("[api] unhandled error:", msg, (err && err.stack) || "");
+    if (KUI_D1_QUOTA.test(msg)) {
+      return new Response(JSON.stringify({ error: "D1_UNAVAILABLE: " + msg, d1_unavailable: true, reset_at: "00:00 UTC" }),
+        { status: 503, headers: { "Content-Type": "application/json", "Retry-After": "300" } });
+    }
+    return new Response(JSON.stringify({ error: "SERVER_ERR: " + msg }),
+      { status: 500, headers: { "Content-Type": "application/json" } });
+  }
+
+  if (key && resp && resp.status === 200) {
+    try {
+      const body = await resp.clone().arrayBuffer();
+      const headers = {};
+      resp.headers.forEach((v, k) => { if (k.toLowerCase() !== "set-cookie") headers[k] = v; });
+      KUI_READ_CACHE.set(key, { t: Date.now(), body, headers, status: resp.status });
+      if (KUI_READ_CACHE.size > KUI_READ_CACHE_MAX) {
+        const oldest = KUI_READ_CACHE.keys().next().value;
+        KUI_READ_CACHE.delete(oldest);
+      }
+    } catch (e) {}
+  }
+  return resp;
+}
+
+async function handleRequest(context) {
     const { request, env, params } = context;
     const method = request.method;
     const action = params.path ? params.path[0] : ''; 
@@ -1219,6 +1346,8 @@ export async function onRequest(context) {
         }
         if (data.argo_urls && data.argo_urls.length > 0) { for (let argo of data.argo_urls) { stmts.push(db.prepare("UPDATE nodes SET sni = ? WHERE id = ? AND vps_ip = ? AND protocol = 'VLESS-Argo' AND sni != ?").bind(argo.url, argo.id, vpsIp, argo.url)); } }
         if (!duplicateReport && totalDelta > 0) stmts.push(db.prepare("INSERT INTO traffic_stats (ip, delta_bytes, timestamp) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM report_receipts WHERE report_id = ? AND applied = 0)").bind(vpsIp, totalDelta, nowMs, data.report_id));
+        // KUI-STATS-AGG: maintain the daily aggregate in the same batch.
+        if (!duplicateReport && totalDelta > 0) stmts.push(db.prepare("INSERT INTO traffic_daily (ip, day, total_bytes) VALUES (?, ?, ?) ON CONFLICT(ip, day) DO UPDATE SET total_bytes = total_bytes + excluded.total_bytes").bind(vpsIp, new Date(nowMs).toISOString().slice(5, 10), totalDelta));
         if (!duplicateReport) stmts.push(db.prepare("UPDATE report_receipts SET applied = 1 WHERE report_id = ? AND applied = 0").bind(data.report_id));
         if (stmts.length > 0) {
             await db.batch(stmts);
@@ -1226,6 +1355,8 @@ export async function onRequest(context) {
         if (nowMs - lastReceiptCleanup > 3600000) {
             lastReceiptCleanup = nowMs;
             context.waitUntil(db.prepare("DELETE FROM report_receipts WHERE created_at < ?").bind(nowMs - 604800000).run().catch(() => {}));
+            // KUI-STATS-AGG: keep the raw table small so the fallback scan stays cheap.
+            context.waitUntil(db.prepare("DELETE FROM traffic_stats WHERE timestamp < ?").bind(nowMs - 604800000).run().catch(() => {}));
         }
         
         let fastMode = false; try { const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first(); if (uiActive && (nowMs - uiActive.ts < 90000)) fastMode = true; } catch(e) {}
@@ -1246,7 +1377,10 @@ export async function onRequest(context) {
         const effectiveInterval = Math.min(300, fastMode ? Math.max(15, reportInterval) : Math.max(90, reportInterval));
         return Response.json({ success: true, fast_mode: fastMode, interval: effectiveInterval, ping_ct: pingCt, ping_cu: pingCu, ping_cm: pingCm });
      } catch (err) {
-        return Response.json({ error: "REPORT_ERR: " + (err && err.message ? err.message : String(err)) }, { status: 500 });
+        const _rm = (err && err.message) ? err.message : String(err);
+        // KUI-D1-DEGRADED: a D1 daily-limit failure must not look like a server bug.
+        if (KUI_D1_QUOTA.test(_rm)) return Response.json({ error: "D1_UNAVAILABLE: " + _rm, d1_unavailable: true, reset_at: "00:00 UTC" }, { status: 503, headers: { "Retry-After": "300" } });
+        return Response.json({ error: "REPORT_ERR: " + _rm }, { status: 500 });
      }
     }
 
@@ -1768,8 +1902,28 @@ export async function onRequest(context) {
         }
         if (action === "user" && params.path[1] === "password" && method === "PUT") { const { password } = await readJsonBody(request, 8 * 1024); if (isAdmin) return Response.json({error: "管理员密码受绝对安全保护，仅可通过 Cloudflare Pages 环境变量修改！"}, {status: 400}); if (String(password || '').length < 12) return Response.json({ error: 'Password must be at least 12 characters' }, { status: 400 }); await db.prepare("UPDATE users SET password = ? WHERE username = ?").bind(await passwordHash(password), currentUser).run(); return Response.json({ success: true }); }
         if (action === "user" && params.path[1] === "sub_token" && method === "PUT") { const newToken = crypto.randomUUID(); if (isAdmin) await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('admin_sub_token', ?, ?)").bind(newToken, Date.now()).run(); else await db.prepare("UPDATE users SET sub_token = ? WHERE username = ?").bind(newToken, currentUser).run(); return Response.json({ success: true, token: newToken }); }
-        if (action === "stats" && method === "GET" && isAdmin) { const query = `SELECT strftime('%m-%d', datetime(timestamp / 1000, 'unixepoch', 'localtime')) as day, SUM(delta_bytes) as total_bytes FROM traffic_stats WHERE ip = ? AND timestamp > ? GROUP BY day ORDER BY day ASC`; const { results } = await db.prepare(query).bind(new URL(request.url).searchParams.get("ip"), Date.now() - 604800000).all(); return Response.json(results || []); }
+        if (action === "stats" && method === "GET" && isAdmin) { const _ip = new URL(request.url).searchParams.get("ip"); let _rows = []; try { const r = await db.prepare("SELECT day, total_bytes FROM traffic_daily WHERE ip = ? ORDER BY day ASC").bind(_ip).all(); _rows = r.results || []; } catch (e) { const query = `SELECT strftime('%m-%d', datetime(timestamp / 1000, 'unixepoch', 'localtime')) as day, SUM(delta_bytes) as total_bytes FROM traffic_stats WHERE ip = ? AND timestamp > ? GROUP BY day ORDER BY day ASC`; const r2 = await db.prepare(query).bind(_ip, Date.now() - 604800000).all(); _rows = r2.results || []; } return Response.json(_rows); }
         
+        if (action === "diag" && method === "GET" && isAdmin) {
+            // KUI-DIAG: how big are the tables and who is calling what.
+            const tables = {};
+            try {
+              for (const t of ["servers", "users", "nodes", "probe_servers", "third_party_nodes", "third_party_subscriptions", "traffic_stats", "traffic_daily", "report_receipts", "proxy_ctrl_servers", "server_logs", "auth_sessions"]) {
+                try { const r = await db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first(); tables[t] = Number((r && r.n) || 0); } catch (e) { tables[t] = "n/a"; }
+              }
+            } catch (e) {}
+            const counters = {};
+            try {
+              const nowB = Math.floor(Date.now() / 600000);
+              for (let i = 0; i < 12; i++) {
+                const c = await caches.default.match(new Request("https://kui-diag.internal/counters/" + (nowB - i)));
+                if (!c) continue;
+                const obj = JSON.parse(await c.text());
+                for (const [k, v] of Object.entries(obj)) counters[k] = (counters[k] || 0) + Number(v || 0);
+              }
+            } catch (e) {}
+            return Response.json({ ok: true, tables, requests_last_2h: counters, note: "counters are per-isolate edge-cache counters, summed over the last 12 x 10min buckets" });
+        }
         if (action === "users" && isAdmin) {
             if (method === "POST") { const { username, password, traffic_limit, expire_time } = await readJsonBody(request, 16 * 1024); const safeUser = String(username || '').trim(); if (!/^[A-Za-z0-9_.-]{1,64}$/.test(safeUser) || safeUser === (env.ADMIN_USERNAME || 'admin')) return Response.json({ error: 'Invalid or reserved username' }, { status: 400 }); if (String(password || '').length < 12) return Response.json({ error: 'Password must be at least 12 characters' }, { status: 400 }); if (await db.prepare("SELECT username FROM users WHERE username = ?").bind(safeUser).first()) return Response.json({ error: "User already exists" }, { status: 409 }); const hash = await passwordHash(password); const subToken = crypto.randomUUID(); await db.prepare("INSERT INTO users (username, password, traffic_limit, expire_time, sub_token) VALUES (?, ?, ?, ?, ?)").bind(safeUser, hash, Math.max(0, Number(traffic_limit)||0), Math.max(0, Number(expire_time)||0), subToken).run(); return Response.json({ success: true }); }
             if (method === "PUT") { const { username, enable, reset_traffic } = await request.json(); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE users SET traffic_used = 0 WHERE username = ?").bind(username)); if (enable !== undefined) statements.push(db.prepare("UPDATE users SET enable = ? WHERE username = ?").bind(enable, username)); if (statements.length) await db.batch(statements); return Response.json({ success: true }); }
