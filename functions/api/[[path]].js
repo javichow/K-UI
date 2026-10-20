@@ -32,7 +32,9 @@ async function protectedSubscriptionResponse(request) {
 }
 
 const MAX_REPORT_BYTES = 256 * 1024;
-const MAX_PROXY_REPORT_BYTES = 32 * 1024;
+// KUI-FREESUB-D1: the report may now carry the VPS-verified third-party
+// subscription (base64, a few hundred KB), so raise the cap.
+const MAX_PROXY_REPORT_BYTES = 2 * 1024 * 1024;
 const MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
 const MAX_NODE_DELTA_BYTES = 1024 * 1024 * 1024 * 1024;
 const MAX_REPORT_DELTA_BYTES = MAX_NODE_DELTA_BYTES * 10;
@@ -83,7 +85,17 @@ function validateProxyReport(data) {
         if (port && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('Invalid proxy port');
         return { tunnel: String(item.tunnel || '').slice(0, 32), active: item.active === true, country: String(item.country || '').toUpperCase().slice(0, 2), port, node_ip: String(item.node_ip || '').slice(0, 64), exit_ip: String(item.exit_ip || '').slice(0, 64), ready: item.ready === true, connected_time: Math.max(0, Math.min(Number(item.connected_time) || 0, 31536000)) };
     });
-    return { ip: data.ip, details: normalized, logs: data.logs?.slice(0, 16 * 1024) || '' };
+    // KUI-FREESUB-D1: the VPS may attach its own third-party subscription that
+    // already passed a reachability + throughput check on the VPS side.
+    let freesubSub = undefined, freesubHash = undefined;
+    if (data.freesub_sub !== undefined && data.freesub_sub !== null && data.freesub_sub !== '') {
+        freesubSub = String(data.freesub_sub);
+        if (freesubSub.length > 1_500_000 || !/^[A-Za-z0-9+/=\r\n]+$/.test(freesubSub)) throw new Error('Invalid freesub subscription');
+    }
+    if (data.freesub_hash !== undefined && data.freesub_hash !== null && data.freesub_hash !== '') {
+        freesubHash = String(data.freesub_hash).slice(0, 64);
+    }
+    return { ip: data.ip, details: normalized, logs: data.logs?.slice(0, 16 * 1024) || '', freesub_sub: freesubSub, freesub_hash: freesubHash };
 }
 
 async function realtimeAdminHeader(env) {
@@ -1316,6 +1328,32 @@ export async function onRequest(context) {
             try { body = validateProxyReport(await readJsonBody(request.clone(), MAX_PROXY_REPORT_BYTES)); }
             catch (error) { return Response.json({ error: error.message || 'Invalid proxy report' }, { status: 400 }); }
             if (!(await verifyAgent(request.headers.get('Authorization'), body.ip, db, env))) return new Response('Unauthorized', { status: 401 });
+            // KUI-FREESUB-D1: the VPS sends a third-party subscription that it
+            // already verified (TCP reachability + real throughput test). Import
+            // it into D1 so the D1-backed subscription only ever serves nodes
+            // that were checked. Re-import only when the content changed.
+            if (body.freesub_sub) {
+                try {
+                    const _hash = body.freesub_hash || '';
+                    const _prev = await db.prepare("SELECT val FROM sys_config WHERE key='freesub_hash'").first();
+                    if (!_prev || _prev.val !== _hash) {
+                        const _parsed = await parseThirdPartySubscription(body.freesub_sub);
+                        let _sub = await db.prepare("SELECT id FROM third_party_subscriptions WHERE name = 'freesub'").first();
+                        const _sid = _sub ? _sub.id : 'freesub-verified';
+                        if (!_sub) {
+                            await db.prepare("INSERT INTO third_party_subscriptions (id, name, url, added_at, last_fetched_at) VALUES (?, ?, ?, ?, ?)").bind(_sid, 'freesub', 'vps://verified', Date.now(), Date.now()).run();
+                        }
+                        await db.prepare("DELETE FROM third_party_nodes WHERE subscription_id = ?").bind(_sid).run();
+                        if (_parsed.nodes.length) {
+                            const _now = Date.now();
+                            const _stmts = _parsed.nodes.map(n => db.prepare("INSERT INTO third_party_nodes (id, subscription_id, name, protocol, address, port, uuid, password, sni, public_key, short_id, flow, network, host, path, extra, enable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(n.id, _sid, n.name, n.protocol, n.address, n.port, n.uuid || '', n.password || '', n.sni || '', n.public_key || '', n.short_id || '', n.flow || '', n.network || '', n.host || '', n.path || '', n.extra || '', 1, _now));
+                            await chunkBatch(db, _stmts);
+                        }
+                        await db.prepare("INSERT INTO sys_config (key, val, ts) VALUES ('freesub_hash', ?, ?) ON CONFLICT(key) DO UPDATE SET val = excluded.val, ts = excluded.ts").bind(_hash, Date.now()).run();
+                        console.log('freesub verified list imported:', _parsed.nodes.length, 'nodes');
+                    }
+                } catch (e) { console.error('freesub import failed:', e && e.message); }
+            }
             return await proxyBridge(method, sub, request, env, body);
         } else if (sub === 'config' && method === 'GET') {
             const requestIp = new URL(request.url).searchParams.get('ip');
