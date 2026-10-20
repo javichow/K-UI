@@ -1072,7 +1072,8 @@ async function checkOfflineServers(env) {
 // independent of the poll rate.
 const KUI_READ_CACHE = new Map();
 const KUI_READ_CACHE_TTL = 60000;   // ms
-const KUI_READ_CACHE_MAX = 400;
+const KUI_READ_CACHE_MAX = 120;
+const KUI_READ_CACHE_MAX_BYTES = 512 * 1024;   // keep the isolate memory sane
 const KUI_CACHEABLE = new Set(["data", "nodes", "users", "vps", "settings",
                                "stats", "probe", "proxy", "thirdparty", "whoami", "sub"]);
 const KUI_D1_QUOTA = /D1_ERROR|exceeded D1|free tier|quota|too much contention/i;
@@ -1247,9 +1248,11 @@ export async function onRequest(context) {
   if (key && resp && resp.status === 200) {
     try {
       const body = await resp.clone().arrayBuffer();
-      const headers = {};
-      resp.headers.forEach((v, k) => { if (k.toLowerCase() !== "set-cookie") headers[k] = v; });
-      KUI_READ_CACHE.set(key, { t: Date.now(), body, headers, status: resp.status });
+      if (body.byteLength <= KUI_READ_CACHE_MAX_BYTES) {
+        const headers = {};
+        resp.headers.forEach((v, k) => { if (k.toLowerCase() !== "set-cookie") headers[k] = v; });
+        KUI_READ_CACHE.set(key, { t: Date.now(), body, headers, status: resp.status });
+      }
       if (KUI_READ_CACHE.size > KUI_READ_CACHE_MAX) {
         const oldest = KUI_READ_CACHE.keys().next().value;
         KUI_READ_CACHE.delete(oldest);
