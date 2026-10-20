@@ -1071,7 +1071,7 @@ async function checkOfflineServers(env) {
 // Authorization, so no data can leak between users. The D1 read cost becomes
 // independent of the poll rate.
 const KUI_READ_CACHE = new Map();
-const KUI_READ_CACHE_TTL = 45000;   // ms
+const KUI_READ_CACHE_TTL = 60000;   // ms
 const KUI_READ_CACHE_MAX = 400;
 const KUI_CACHEABLE = new Set(["data", "nodes", "users", "vps", "settings",
                                "stats", "probe", "proxy", "thirdparty", "whoami", "sub"]);
@@ -1138,6 +1138,11 @@ export async function onRequest(context) {
       const tables = {};
       try {
         const _db = env.DB;
+        // CREATE TABLE is a write, so this still works while the daily row-READ
+        // limit is exhausted - the two tables added later then exist for the
+        // first request after the quota reset.
+        try { await _db.prepare("CREATE TABLE IF NOT EXISTS traffic_daily (ip TEXT NOT NULL, day TEXT NOT NULL, total_bytes INTEGER DEFAULT 0, PRIMARY KEY (ip, day))").run(); } catch (e) {}
+        try { await _db.prepare("CREATE TABLE IF NOT EXISTS req_counts (bucket INTEGER NOT NULL, action TEXT NOT NULL, hits INTEGER DEFAULT 0, misses INTEGER DEFAULT 0, PRIMARY KEY (bucket, action))").run(); } catch (e) {}
         for (const t of ["servers", "users", "nodes", "probe_servers", "third_party_nodes", "third_party_subscriptions", "traffic_stats", "traffic_daily", "report_receipts", "proxy_ctrl_servers", "server_logs", "auth_sessions"]) {
           try { const r = await _db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first(); tables[t] = Number((r && r.n) || 0); } catch (e) { tables[t] = "n/a"; }
         }
@@ -1192,7 +1197,7 @@ export async function onRequest(context) {
           const body = await resp.clone().arrayBuffer();
           const headers = new Headers(resp.headers);
           headers.delete("cache-control");
-          headers.set("cache-control", "public, max-age=60");
+          headers.set("cache-control", "public, max-age=300");
           context.waitUntil(caches.default.put(cacheKey, new Response(body, { status: 200, headers })).catch(() => {}));
         } catch (e) {}
       }
