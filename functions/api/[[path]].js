@@ -1095,9 +1095,49 @@ async function kuiFlushCounters(context) {
 }
 
 export async function onRequest(context) {
-  const { request } = context;
+  const { request, env } = context;
   const method = request.method;
   const action = (context.params && context.params.path && context.params.path[0]) || "";
+
+  // KUI-DIAG: table sizes + per-endpoint request counters. Authenticated with
+  // the admin account (Basic, straight from the env) so that it keeps working
+  // while D1 is rate limited - the counters live in the edge cache, not in D1.
+  if (action === "diag" && method === "GET") {
+    try {
+      const _h = request.headers.get("Authorization") || "";
+      const _u = env.ADMIN_USERNAME || "admin";
+      let _ok = false;
+      if (_h.startsWith("Basic ")) {
+        try {
+          _ok = _h === ("Basic " + btoa(_u + ":" + (env.ADMIN_PASSWORD || "")));
+        } catch (e) { _ok = false; }
+      }
+      if (!_ok) return new Response(JSON.stringify({ error: "Unauthorized" }),
+        { status: 401, headers: { "Content-Type": "application/json" } });
+      const tables = {};
+      try {
+        const _db = env.DB;
+        for (const t of ["servers", "users", "nodes", "probe_servers", "third_party_nodes", "third_party_subscriptions", "traffic_stats", "traffic_daily", "report_receipts", "proxy_ctrl_servers", "server_logs", "auth_sessions"]) {
+          try { const r = await _db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first(); tables[t] = Number((r && r.n) || 0); } catch (e) { tables[t] = "n/a"; }
+        }
+      } catch (e) {}
+      const counters = {};
+      try {
+        const nowB = Math.floor(Date.now() / 600000);
+        for (let i = 0; i < 18; i++) {
+          const c = await caches.default.match(new Request("https://kui-diag.internal/counters/" + (nowB - i)));
+          if (!c) continue;
+          const obj = JSON.parse(await c.text());
+          for (const [k, v] of Object.entries(obj)) counters[k] = (counters[k] || 0) + Number(v || 0);
+        }
+      } catch (e) {}
+      return Response.json({ ok: true, now: new Date().toISOString(), tables, requests_last_3h: counters,
+        note: "counters = per-isolate edge-cache counters summed over the last 18 x 10min buckets" });
+    } catch (err) {
+      return Response.json({ error: "DIAG_ERR: " + ((err && err.message) || String(err)) },
+        { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+  }
   KUI_COUNTERS.set(action, (KUI_COUNTERS.get(action) || 0) + 1);
   if (Date.now() - KUI_COUNTER_FLUSH > 600000) {
     KUI_COUNTER_FLUSH = Date.now();
@@ -1938,26 +1978,6 @@ async function handleRequest(context) {
         if (action === "user" && params.path[1] === "sub_token" && method === "PUT") { const newToken = crypto.randomUUID(); if (isAdmin) await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('admin_sub_token', ?, ?)").bind(newToken, Date.now()).run(); else await db.prepare("UPDATE users SET sub_token = ? WHERE username = ?").bind(newToken, currentUser).run(); return Response.json({ success: true, token: newToken }); }
         if (action === "stats" && method === "GET" && isAdmin) { const _ip = new URL(request.url).searchParams.get("ip"); let _rows = []; try { const r = await db.prepare("SELECT day, total_bytes FROM traffic_daily WHERE ip = ? ORDER BY day ASC").bind(_ip).all(); _rows = r.results || []; } catch (e) { const query = `SELECT strftime('%m-%d', datetime(timestamp / 1000, 'unixepoch', 'localtime')) as day, SUM(delta_bytes) as total_bytes FROM traffic_stats WHERE ip = ? AND timestamp > ? GROUP BY day ORDER BY day ASC`; const r2 = await db.prepare(query).bind(_ip, Date.now() - 604800000).all(); _rows = r2.results || []; } return Response.json(_rows); }
         
-        if (action === "diag" && method === "GET" && isAdmin) {
-            // KUI-DIAG: how big are the tables and who is calling what.
-            const tables = {};
-            try {
-              for (const t of ["servers", "users", "nodes", "probe_servers", "third_party_nodes", "third_party_subscriptions", "traffic_stats", "traffic_daily", "report_receipts", "proxy_ctrl_servers", "server_logs", "auth_sessions"]) {
-                try { const r = await db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first(); tables[t] = Number((r && r.n) || 0); } catch (e) { tables[t] = "n/a"; }
-              }
-            } catch (e) {}
-            const counters = {};
-            try {
-              const nowB = Math.floor(Date.now() / 600000);
-              for (let i = 0; i < 12; i++) {
-                const c = await caches.default.match(new Request("https://kui-diag.internal/counters/" + (nowB - i)));
-                if (!c) continue;
-                const obj = JSON.parse(await c.text());
-                for (const [k, v] of Object.entries(obj)) counters[k] = (counters[k] || 0) + Number(v || 0);
-              }
-            } catch (e) {}
-            return Response.json({ ok: true, tables, requests_last_2h: counters, note: "counters are per-isolate edge-cache counters, summed over the last 12 x 10min buckets" });
-        }
         if (action === "users" && isAdmin) {
             if (method === "POST") { const { username, password, traffic_limit, expire_time } = await readJsonBody(request, 16 * 1024); const safeUser = String(username || '').trim(); if (!/^[A-Za-z0-9_.-]{1,64}$/.test(safeUser) || safeUser === (env.ADMIN_USERNAME || 'admin')) return Response.json({ error: 'Invalid or reserved username' }, { status: 400 }); if (String(password || '').length < 12) return Response.json({ error: 'Password must be at least 12 characters' }, { status: 400 }); if (await db.prepare("SELECT username FROM users WHERE username = ?").bind(safeUser).first()) return Response.json({ error: "User already exists" }, { status: 409 }); const hash = await passwordHash(password); const subToken = crypto.randomUUID(); await db.prepare("INSERT INTO users (username, password, traffic_limit, expire_time, sub_token) VALUES (?, ?, ?, ?, ?)").bind(safeUser, hash, Math.max(0, Number(traffic_limit)||0), Math.max(0, Number(expire_time)||0), subToken).run(); return Response.json({ success: true }); }
             if (method === "PUT") { const { username, enable, reset_traffic } = await request.json(); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE users SET traffic_used = 0 WHERE username = ?").bind(username)); if (enable !== undefined) statements.push(db.prepare("UPDATE users SET enable = ? WHERE username = ?").bind(enable, username)); if (statements.length) await db.batch(statements); return Response.json({ success: true }); }
