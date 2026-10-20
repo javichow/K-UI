@@ -606,6 +606,10 @@ async function ensureDbSchema(db) {
             try {
                 await db.prepare("SELECT username FROM auth_sessions LIMIT 1").first();
                 await db.prepare("SELECT username FROM nodes LIMIT 1").first();
+                // KUI-SCHEMA-PROBE: also make sure the tables added later
+                // exist, otherwise the early return would skip their creation.
+                await db.prepare("SELECT COUNT(*) AS n FROM traffic_daily LIMIT 1").first();
+                await db.prepare("SELECT COUNT(*) AS n FROM req_counts LIMIT 1").first();
                 return;
             } catch (e) {
                 const _m = String((e && e.message) || e || '');
@@ -1439,11 +1443,18 @@ async function handleRequest(context) {
         }
         if (data.argo_urls && data.argo_urls.length > 0) { for (let argo of data.argo_urls) { stmts.push(db.prepare("UPDATE nodes SET sni = ? WHERE id = ? AND vps_ip = ? AND protocol = 'VLESS-Argo' AND sni != ?").bind(argo.url, argo.id, vpsIp, argo.url)); } }
         if (!duplicateReport && totalDelta > 0) stmts.push(db.prepare("INSERT INTO traffic_stats (ip, delta_bytes, timestamp) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM report_receipts WHERE report_id = ? AND applied = 0)").bind(vpsIp, totalDelta, nowMs, data.report_id));
-        // KUI-STATS-AGG: maintain the daily aggregate in the same batch.
-        if (!duplicateReport && totalDelta > 0) stmts.push(db.prepare("INSERT INTO traffic_daily (ip, day, total_bytes) VALUES (?, ?, ?) ON CONFLICT(ip, day) DO UPDATE SET total_bytes = total_bytes + excluded.total_bytes").bind(vpsIp, new Date(nowMs).toISOString().slice(5, 10), totalDelta));
+        // KUI-STATS-AGG: the daily aggregate is written separately (below) so a
+        // missing table can never break the whole report batch.
         if (!duplicateReport) stmts.push(db.prepare("UPDATE report_receipts SET applied = 1 WHERE report_id = ? AND applied = 0").bind(data.report_id));
         if (stmts.length > 0) {
             await db.batch(stmts);
+        }
+        // KUI-STATS-AGG: per-day totals (kept out of the batch on purpose).
+        if (!duplicateReport && totalDelta > 0) {
+            try {
+                await db.prepare("INSERT INTO traffic_daily (ip, day, total_bytes) VALUES (?, ?, ?) ON CONFLICT(ip, day) DO UPDATE SET total_bytes = total_bytes + excluded.total_bytes")
+                    .bind(vpsIp, new Date(nowMs).toISOString().slice(5, 10), totalDelta).run();
+            } catch (e) { console.error('[traffic_daily] skipped:', e && e.message); }
         }
         if (nowMs - lastReceiptCleanup > 3600000) {
             lastReceiptCleanup = nowMs;
