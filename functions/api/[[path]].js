@@ -524,7 +524,9 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS report_receipts (report_id TEXT PRIMARY KEY, vps_ip TEXT NOT NULL, created_at INTEGER NOT NULL, applied INTEGER DEFAULT 1)`,
         `CREATE TABLE IF NOT EXISTS auth_replays (nonce TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS login_throttles (key TEXT PRIMARY KEY, failures INTEGER NOT NULL, window_started_at INTEGER NOT NULL, blocked_until INTEGER NOT NULL DEFAULT 0)`,
-        `CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`
+        `CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`,
+      // KUI-DIAG: per-endpoint request / cache-miss counters (cache misses == D1 reads).
+      `CREATE TABLE IF NOT EXISTS req_counts (bucket INTEGER NOT NULL, action TEXT NOT NULL, hits INTEGER DEFAULT 0, misses INTEGER DEFAULT 0, PRIMARY KEY (bucket, action))`
     ];
     for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
     try { await db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'").run(); } catch (e) {}
@@ -1071,6 +1073,7 @@ const KUI_CACHEABLE = new Set(["data", "nodes", "users", "vps", "settings",
                                "stats", "probe", "proxy", "thirdparty", "whoami", "sub"]);
 const KUI_D1_QUOTA = /D1_ERROR|exceeded D1|free tier|quota|too much contention/i;
 const KUI_COUNTERS = new Map();
+const KUI_MISSES = new Map();
 let KUI_COUNTER_FLUSH = 0;
 
 function kuiCacheKey(context) {
@@ -1079,19 +1082,33 @@ function kuiCacheKey(context) {
           (context.request.headers.get("Authorization") || "")).slice(0, 700);
 }
 
-// KUI-DIAG: per-endpoint request counters, flushed to the edge cache (no D1
-// writes) every 10 minutes so /api/diag can show where the requests come from.
+// KUI-DIAG: per-endpoint request counters and cache-miss counters. A cache
+// miss is exactly one D1 read, so the miss counter IS the D1 read rate.
+// Flushed every 10 minutes to the edge cache AND to D1 (the edge cache is
+// per-datacenter, D1 gives the global view).
 async function kuiFlushCounters(context) {
   try {
-    if (!KUI_COUNTERS.size) return;
+    if (!KUI_COUNTERS.size && !KUI_MISSES.size) return;
     const bucket = Math.floor(Date.now() / 600000);
     const payload = {};
     for (const [k, v] of KUI_COUNTERS) payload[k] = v;
     await caches.default.put(
       new Request("https://kui-diag.internal/counters/" + bucket),
       new Response(JSON.stringify(payload), { headers: { "Cache-Control": "max-age=3600" } }));
+    try {
+      const db = context.env && context.env.DB;
+      if (db) {
+        const stmts = [];
+        for (const [k, v] of KUI_COUNTERS) {
+          const miss = KUI_MISSES.get(k) || 0;
+          stmts.push(db.prepare("INSERT INTO req_counts (bucket, action, hits, misses) VALUES (?, ?, ?, ?) ON CONFLICT(bucket, action) DO UPDATE SET hits = hits + excluded.hits, misses = misses + excluded.misses").bind(bucket, k, v, miss));
+        }
+        if (stmts.length) await db.batch(stmts);
+      }
+    } catch (e) {}
     KUI_COUNTERS.clear();
-  } catch (e) { /* cache API unavailable - diagnostics only */ }
+    KUI_MISSES.clear();
+  } catch (e) { /* diagnostics only */ }
 }
 
 export async function onRequest(context) {
@@ -1131,8 +1148,17 @@ export async function onRequest(context) {
           for (const [k, v] of Object.entries(obj)) counters[k] = (counters[k] || 0) + Number(v || 0);
         }
       } catch (e) {}
-      return Response.json({ ok: true, now: new Date().toISOString(), tables, requests_last_3h: counters,
-        note: "counters = per-isolate edge-cache counters summed over the last 18 x 10min buckets" });
+      // KUI-DIAG: the global (D1) view - hits vs cache misses (= D1 reads).
+      const global = {};
+      try {
+        const db = env.DB;
+        if (db) {
+          const r = await db.prepare("SELECT action, SUM(hits) AS h, SUM(misses) AS m FROM req_counts WHERE bucket >= ? GROUP BY action").bind(Math.floor(Date.now() / 600000) - 36).all();
+          for (const row of (r.results || [])) global[row.action] = { hits: Number(row.h || 0), d1_reads: Number(row.m || 0) };
+        }
+      } catch (e) {}
+      return Response.json({ ok: true, now: new Date().toISOString(), tables, requests_last_3h: counters, last_6h: global,
+        note: "d1_reads = cache misses; hits = total requests. Edge-cache counters are per-datacenter, the D1 view is global." });
     } catch (err) {
       return Response.json({ error: "DIAG_ERR: " + ((err && err.message) || String(err)) },
         { status: 500, headers: { "Content-Type": "application/json" } });
@@ -1189,6 +1215,8 @@ export async function onRequest(context) {
       return new Response(hit.body, { status: hit.status, headers: h });
     }
   }
+  // KUI-DIAG: a cache miss is one D1 read for this endpoint.
+  KUI_MISSES.set(action, (KUI_MISSES.get(action) || 0) + 1);
 
   let resp;
   try {
