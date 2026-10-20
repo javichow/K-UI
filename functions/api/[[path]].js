@@ -1182,6 +1182,31 @@ export async function onRequest(context) {
   return resp;
 }
 
+// KUI-SUB-FALLBACK: while the D1 daily row-read limit is exhausted the
+// subscription cannot be assembled from the database. The VPS keeps an
+// independent, already verified copy of the same node list, so serve that
+// instead - the client keeps working instead of getting a 404/503.
+async function kuiVpsSubscriptionFallback(request) {
+  try {
+    const url = new URL(request.url);
+    const q = url.search || "";
+    const r = await fetch("http://mail.juyougao.com:8920/api/freesub/sub" + q, {
+      headers: { "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0" },
+      cf: { cacheTtl: 60 }
+    });
+    if (!r.ok) return null;
+    const body = await r.arrayBuffer();
+    const headers = new Headers();
+    headers.set("Content-Type", "text/plain; charset=utf-8");
+    headers.set("X-KUI-Fallback", "vps-freesub");
+    for (const h of ["content-disposition", "profile-title", "profile-update-interval", "subscription-userinfo"]) {
+      const v = r.headers.get(h);
+      if (v) headers.set(h, v);
+    }
+    return new Response(body, { status: 200, headers });
+  } catch (e) { return null; }
+}
+
 async function handleRequest(context) {
     const { request, env, params } = context;
     const method = request.method;
@@ -1523,12 +1548,19 @@ async function handleRequest(context) {
             let isValid = false;
             if (reqUser === adminUser) { 
                 let adminSubToken = '';
-                try { const r = await db.prepare("SELECT val FROM sys_config WHERE key='admin_sub_token'").first(); if(r && r.val) adminSubToken = r.val; } catch(e){} 
+                try { const r = await db.prepare("SELECT val FROM sys_config WHERE key='admin_sub_token'").first(); if(r && r.val) adminSubToken = r.val; } catch(e){ // KUI-SUB-FALLBACK: the token could not be read because D1 is out of quota.
+                    if (KUI_D1_QUOTA.test(String((e && e.message) || e))) { const fb = await kuiVpsSubscriptionFallback(request); if (fb) return fb; } } 
                 isValid = !!adminSubToken && token === adminSubToken;
             } 
             else { 
-                const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ? AND enable = 1").bind(reqUser).first();
-                if (u) isValid = !!u.sub_token && token === u.sub_token;
+                try {
+                    const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ? AND enable = 1").bind(reqUser).first();
+                    if (u) isValid = !!u.sub_token && token === u.sub_token;
+                } catch (e) {
+                    // KUI-SUB-FALLBACK: D1 is out of quota -> serve the VPS copy.
+                    if (KUI_D1_QUOTA.test(String((e && e.message) || e))) { const fb = await kuiVpsSubscriptionFallback(request); if (fb) return fb; }
+                    throw e;
+                }
             }
         
             // Invalid tokens deliberately look like absent endpoints. Protected
@@ -1795,6 +1827,8 @@ async function handleRequest(context) {
         } catch (subErr) {
             const _m = String((subErr && subErr.message) || subErr || '');
             console.error('[api/sub] build failed:', _m, (subErr && subErr.stack) || '');
+            // KUI-SUB-FALLBACK: keep the client working while D1 is rate limited.
+            if (KUI_D1_QUOTA.test(_m)) { const fb = await kuiVpsSubscriptionFallback(request); if (fb) return fb; }
             return new Response(JSON.stringify({ error: "SUB_ERR: " + _m, d1_unavailable: /D1_ERROR|exceeded D1|free tier|quota/i.test(_m) }),
                 { status: 500, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
         }
